@@ -147,7 +147,7 @@ def segment_softmax(seglen, value):
     # and the running sum of exponentials live in two `d`-long scratch rows.
     # Upstream composes the same result out of five passes and two (n, d)
     # temporaries; the arithmetic and its order are unchanged.
-    scratch = np.empty(2 * d, dtype=np.float64)
+    scratch = np.empty(lib().mdgl_workers() * 2 * d, dtype=np.float64)
     lib().mdgl_segment_softmax(
         addr(offsets), addr(value), addr(dst), addr(scratch), num_seg, d, n
     )
@@ -187,6 +187,26 @@ def segment_mm(a, b, seglen_a):
     if b_d1 != d1:
         raise DGLError("inner dimensions do not match: {} vs {}".format(d1, b_d1))
     seglen_a = i64(seglen_a)
+    # The kernel walks `b` once per segment, indexing `seglen_a[seg]`, and steps
+    # `row` by that length until it passes `n`. Neither the `b` block nor the
+    # `dst` row has a bounds check inside the kernel, so everything the walk
+    # depends on is checked here: one length per block, all of them
+    # non-negative, and a total that lands exactly on `n`. Upstream's CPU path
+    # reaches the same conclusion by indexing `seglen_A[i]` for `i` in
+    # `range(B.shape[0])` and slicing `a` per length, so it raises IndexError on
+    # the same inputs.
+    if seglen_a.size != r:
+        raise DGLError(
+            "seglen_a must have one entry per b block: {} != {}".format(seglen_a.size, r)
+        )
+    if seglen_a.size:
+        lo = int(seglen_a.min())
+        total = int(seglen_a.sum())
+        if lo < 0 or total > n:
+            raise DGLError(
+                "segment lengths must be non-negative and sum to {}, got a minimum "
+                "of {} and a sum of {}".format(n, lo, total)
+            )
     dst = np.zeros((n, d2), dtype=np.float64)
     if n == 0:
         return dst

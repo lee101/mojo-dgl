@@ -158,6 +158,16 @@ def test_pull_matches_upstream():
     assert_close(ours.ndata["h"], theirs.ndata["w"], atol=1e-10)
 
 
+def test_pull_with_a_udf_message_function():
+    """`pull` takes the same UDFs `update_all` does, builtin or not."""
+    ours, theirs = pair()
+    nodes = np.array([1, 5, 9, 40])
+    message = lambda edges: {"m": edges.src["x"] * edges.data["e"] + 1.0}
+    ours.pull(nodes, message, fn.mean("m", "h"))
+    theirs.pull(nodes, message, dgl_fn.mean("m", "h"))
+    assert_close(ours.ndata["h"], theirs.ndata["h"], atol=1e-10)
+
+
 # ------------------------------------------------- published upstream vectors
 def test_update_all_docstring_example():
     g = dgl_mojo.graph(([0, 1, 2, 3], [1, 2, 3, 4]))
@@ -197,11 +207,14 @@ def test_segment_docstring_example():
     np.testing.assert_allclose(soft[6], [0.25, 0.25, 0.25])
 
 
-def test_pull_matches_upstream():
+def test_pull_touches_only_the_pulled_rows():
+    """Both libraries leave the rows outside `v` at zero, not stale."""
     ours_g, theirs_g = pair()
     nodes = np.array([0, 2])
     ours_g.pull(nodes, fn.u_mul_e("x", "e", "m"), fn.sum("m", "z"))
     theirs_g.pull(nodes, dgl_fn.u_mul_e("x", "e", "m"), dgl_fn.sum("m", "z"))
+    ours_g.ndata["z"][1] = 7.0
+    theirs_g.ndata["z"][1] = 7.0
     assert_close(ours_g.ndata["z"], theirs_g.ndata["z"], atol=1e-12, label="pull")
 
 

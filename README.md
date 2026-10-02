@@ -40,18 +40,27 @@ arrays, plus the worked examples printed in upstream's own docstrings.
 | --- | --- |
 | `dgl.convert` | `graph(data, *, num_nodes=None, idtype=None, device=None, row_sorted=False, col_sorted=False)` |
 | `dgl.heterograph` | `DGLGraph`: `number_of_nodes/src_nodes/dst_nodes`, `num_nodes/num_edges`, `number_of_edges`, `edges`, `in_edges`, `out_edges`, `in_degrees`, `out_degrees`, `canonical_etypes`, `ndata`, `edata`, `update_all`, `pull` |
-| `dgl.function` | `TargetCode`, `BuiltinFunction`, `MessageFunction`, `BinaryMessageFunction`, `CopyMessageFunction`, `copy_u`, `copy_e`, all 30 generated `u_add_v` … `e_dot_v` message builtins, `ReduceFunction`, `SimpleReduceFunction`, `sum` / `max` / `min` / `mean` |
-| `dgl.ops.sddmm` | `gsddmm`, `reshape_lhs_rhs`, all 30 generated `u_add_v` … `e_dot_v` SDDMMs, `copy_u`, `copy_v`, `copy_e` |
+| `dgl.function` | `TargetCode`, `BuiltinFunction`, `BinaryMessageFunction`, `CopyMessageFunction`, `copy_u`, `copy_e`, all 30 generated `u_add_v` … `e_dot_v` message builtins, `sum` / `max` / `min` / `mean` |
+| `dgl.ops.sddmm` | `gsddmm`, `copy_u`, `copy_v`, `copy_e`, all 30 generated `u_add_v` … `e_dot_v` SDDMMs |
 | `dgl.ops.spmm` | `gspmm` and all 24 generated `u_{add,sub,mul,div}_e_{sum,max,min,mean}`, `copy_u_*`, `copy_e_*` |
 | `dgl.ops.segment` | `segment_reduce`, `segment_softmax`, `segment_mm` |
-| `dgl.ops.edge_softmax` | `edge_softmax(graph, logits, eids=ALL, norm_by="dst")` |
+| `dgl.ops.edge_softmax` | `edge_softmax(graph, logits, eids=ALL, norm_by="dst")`, on `(E,)`, `(E, 1)` and upstream's `(E, *, 1)` |
 | `dgl.ops.gather_mm` | `gather_mm(a, b, *, idx_b)`, both the fused and the segment-`mm` path |
 | `dgl.nn.functional` | `edge_softmax` (upstream 2.x re-exports it from `dgl.ops`) |
 
-That is 64 names in `mojodgl.ops` alone. On the Mojo side `src/ported.mojo` is
-the kernel file, laid out in upstream's own source order: the array primitives
-first (they are what `dgl/ops/segment.py` is written against), then
-`dgl/function`, then `dgl/ops` in the order `ops/__init__.py` imports it.
+That is 64 names in `mojodgl.ops`: 34 from `sddmm`, 25 from `spmm`, and the 5
+from `segment`, `edge_softmax` and `gather_mm`. On the Mojo side
+`src/ported.mojo` is the kernel file, laid out in upstream's own source order:
+the array primitives first (they are what `dgl/ops/segment.py` is written
+against), then `dgl/function`, then `dgl/ops` in the order `ops/__init__.py`
+imports it.
+
+`reshape_lhs_rhs` is ported and reachable as `mojodgl.ops.sddmm.reshape_lhs_rhs`,
+but it is not in `ops.__all__` — upstream does not export it either. The base
+classes `MessageFunction`, `ReduceFunction` and `SimpleReduceFunction` exist in
+this port (they are what the builtins subclass) but, as upstream, they are not
+re-exported from `mojodgl.function`; import them from
+`mojodgl.function.message` and `mojodgl.function.reducer`.
 
 ## What is not implemented, and why
 
@@ -76,14 +85,28 @@ Every item below is a deliberate limit, not an oversight.
   `(N, max_in_degree, D)` mailbox; this port passes the `(N, D)` sum over
   in-edges, zero-filled for nodes with no in-edges. The builtin reducers are
   unaffected — they go through the kernel, not the mailbox.
-- **`edge_softmax` logits.** Upstream accepts `(E, *, *)`; this port accepts
-  1-D or `(E, 1)`, which is what GAT and attention layers actually use. Upstream
-  also returns a buffer as long as `logits` with the selected results in the
-  first `len(eids)` positions, and so does this port — the docstring example
-  that shows a 4-row result is stale relative to the shipped kernel.
-- **`pull`.** Works with a builtin message function only; upstream also accepts
-  a UDF. It runs the same fused kernel over the induced in-edge subgraph and
-  writes back only the requested rows.
+- **`edge_softmax` with a subset `eids`.** Upstream's kernel is handed a CSR
+  rebuilt from the selection, and it indexes `logits` by POSITION in `eids`
+  rather than by edge id: `Edge_softmax_forward` calls `CalcBcastOff` and then
+  `Edge_softmax_csr_forward` on a `CSRMatrix` whose row length is the number of
+  selected edges sharing that endpoint, so row `i` reads `logits[i]`, not
+  `logits[eids[i]]`. This port reproduces it exactly rather than "fixing" it:
+  the selection's positions are grouped by endpoint, in the order they appear in
+  `eids`, and position `i` takes the softmax of `logits[i]` over its group. Both
+  `norm_by` share the behaviour, and with `eids` is `ALL` positions and edge
+  ids coincide, so the `ALL` path is unaffected. The rule was established by
+  black-box probing and is pinned by `tests/test_edge_softmax_eids.py`, which
+  checks it against upstream at selection sizes 1 to 16 for both `norm_by`,
+  states it as an explicit rule, and re-derives it from 200 random selections.
+  Upstream's own docstring example, which shows a four-row result for a
+  four-edge selection, is stale relative to the shipped kernel: it returns a
+  buffer as long as `logits`, with the selected results in the first
+  `len(eids)` positions, and so does this port. Logits themselves follow
+  upstream's documented `(E, *, 1)` shape: `(E,)`, `(E, 1)` and `(E, H, 1)` all
+  work, and every trailing column is an independent softmax.
+- **`pull`.** It runs the same message-passing machinery as `update_all` over
+  the induced in-edge subgraph, with builtin or user-defined message functions,
+  and writes back only the requested rows.
 - **Not ported at all:** `send`, `recv`, `send_and_recv`, `push`, `dgl.readout`,
   `dgl.dataloading`, `dgl.sampling`, `dgl.transforms`, `dgl.nn.pytorch` and
   every other framework binding, autograd/backward for any of the above, and the
@@ -121,58 +144,96 @@ that need dgl skip.
 
 ## Performance
 
-The table below is one `pixi run bench` invocation on one graph of 200,000 nodes
-and 1,000,000 random edges, float64 features, 32 columns. Both libraries get the
-same arrays, each number is the best of three runs, and nothing here is
-extrapolated. Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, 72 cores,
-Linux x86_64, AVX2, torch 2.3.1.post100, dgl 2.3.0. `W`, the SIMD width these
-kernels are built at, is 4 float64 lanes here.
+The table below is one `pixi run bench` invocation on one graph of 200,000
+nodes and 1,000,000 random edges, float64 features, 32 columns. Both
+libraries get the same arrays, each number is the best of three runs, and
+nothing here is extrapolated. Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @
+2.30GHz, 72 cores, Linux x86_64, AVX2, torch 2.3.1.post100, dgl 2.3.0. `W`,
+the SIMD width these kernels are built at, is 4 float64 lanes here.
 
 | case | mojo-dgl | dgl | speedup |
 | --- | ---: | ---: | ---: |
-| `u_mul_e_sum` (1M edges, 32d) | 269.6 ms | 68.7 ms | 0.25x |
-| `u_add_e_mean` (1M edges, 32d) | 292.9 ms | 141.4 ms | 0.48x |
-| `u_div_e_min` (1M edges, 32d) | 396.6 ms | 400.9 ms | **1.01x** |
-| `copy_u_max` (1M edges, 32d) | 167.0 ms | 95.4 ms | 0.57x |
-| `copy_e_mean` (1M edges, 32d) | 151.7 ms | 127.0 ms | 0.84x |
-| `u_dot_e` (SDDMM, 1M edges, 32d) | 158.3 ms | 51.0 ms | 0.32x |
-| `u_mul_v` (SDDMM, 1M edges, 32d) | 295.7 ms | 108.8 ms | 0.37x |
-| `edge_softmax` norm_by=dst (1M edges) | 49.9 ms | 39.9 ms | 0.80x |
-| `edge_softmax` norm_by=src (1M edges) | 48.8 ms | 34.9 ms | 0.71x |
-| `segment_reduce` sum (1M rows, 32d, 200k segments) | 85.9 ms | 60.3 ms | 0.70x |
-| `segment_reduce` max (1M rows, 32d, 200k segments) | 158.4 ms | 177.5 ms | **1.12x** |
-| `segment_softmax` (1M rows, 32d, 200k segments) | 642.5 ms | 808.1 ms | **1.26x** |
-| `gather_mm` (1M rows, 16x16, 64 blocks) | 1010.6 ms | 3763.6 ms | **3.72x** |
-| `update_all` `u_mul_e` + `sum` (1M edges, 32d) | 314.1 ms | 93.8 ms | 0.30x |
-| `update_all` `copy_u` + `max` (1M edges, 32d) | 218.9 ms | 167.3 ms | 0.76x |
+| `u_mul_e_sum` (1M edges, 32d) | 158.7 ms | 60.4 ms | 0.38x |
+| `u_add_e_mean` (1M edges, 32d) | 179.0 ms | 70.6 ms | 0.39x |
+| `u_div_e_min` (1M edges, 32d) | 205.8 ms | 234.5 ms | 1.14x |
+| `copy_u_max` (1M edges, 32d) | 99.2 ms | 52.6 ms | 0.53x |
+| `copy_e_mean` (1M edges, 32d) | 91.4 ms | 53.5 ms | 0.59x |
+| `u_dot_e` (SDDMM, 1M edges, 32d) | 114.6 ms | 34.6 ms | 0.30x |
+| `u_mul_v` (SDDMM, 1M edges, 32d) | 306.5 ms | 75.4 ms | 0.25x |
+| `edge_softmax` norm_by=dst (1M edges) | 32.6 ms | 4.0 ms | 0.12x |
+| `edge_softmax` norm_by=src (1M edges) | 32.6 ms | 4.6 ms | 0.14x |
+| `edge_softmax` 8 heads (1M edges, `(E, 8, 1)`) | 200.8 ms | 28.9 ms | 0.14x |
+| `segment_reduce` sum (1M rows, 32d, 200k segments) | 60.2 ms | 30.5 ms | 0.51x |
+| `segment_reduce` max (1M rows, 32d, 200k segments) | 102.2 ms | 104.0 ms | 1.02x |
+| `segment_softmax` (1M rows, 32d, 200k segments) | 380.3 ms | 479.2 ms | **1.26x** |
+| `gather_mm` (1M rows, 16x16, 64 blocks) | 127.4 ms | 402.2 ms | **3.16x** |
+| `update_all` `u_mul_e` + `sum` (1M edges, 32d) | 164.1 ms | 44.5 ms | 0.27x |
+| `update_all` `copy_u` + `max` (1M edges, 32d) | 131.0 ms | 87.6 ms | 0.67x |
 
-Read those ratios with the load in mind. This port is single-threaded; dgl's
-kernels are OpenMP-parallel and spread over 72 cores, so the two-gather cases
-are lost on memory latency rather than on arithmetic: `u_mul_e_sum` and
-`u_mul_v` each do two random row reads per edge, and dgl gets 72 cores to hide
-that latency behind. The cases this port wins are the ones with a
-single sequential scan, where there is no latency to hide and dgl's threads
-only add bookkeeping. Which cases those are moves with the box's load: the same
-binary measured `gather_mm` at 1.24x and `segment_reduce` max at 1.95x on
-earlier runs the same day, and at 3.72x and 1.12x on the run above. The box is
-shared, and re-running moves every number in the table in both columns, so treat a single
-ratio as an order of magnitude, not a measurement of the code.
+**Read the two columns apart before reading the ratio.** The box this was
+measured on is shared and heavily loaded, which penalises the two columns
+unequally: this port is 32 threads and dgl's kernels are OpenMP over every core,
+so a loaded box distorts them by different amounts. The ratios below are
+therefore an upper bound on this port's standing, not a clean measurement of
+either library at its best. Nothing in the table is extrapolated: every number
+is the best of three runs of the case named, from the run recorded above.
 
-### Design decisions that follow from that
+mojodgl still loses most of the table, and the reason is that dgl's kernels are
+multi-threaded C++ while the work these kernels do is memory-bound. The
+ranking inside the table is worth reading. The wins and near misses —
+`gather_mm`, `segment_softmax`, `u_div_e_min`, `segment_reduce` max — are the
+cases that are one sequential scan over memory, or a matmul small enough to
+stay in cache, with a cheap inner body. That is where upstream's threads have
+least to add.
+
+The worst cases are the ones whose cost is memory latency. `u_dot_e` and
+`u_mul_v` issue two or more random-indexed loads per edge, and that latency is
+hard to hide. Both kernels are already moving hundreds of megabytes in the time
+shown, which is the machine's random-gather bandwidth, so there is little
+arithmetic left to take out of either — see "What was tried and did not pay"
+below.
+
+### Where the time goes in this port
 
 - **The column loop is a vector loop.** `gspmm`, `gsddmm`, `segment_reduce`,
   `segment_softmax` and `segment_mm` walk the feature columns `W` lanes at a
   time (`p.unsafe_load[width=W]`, `p.unsafe_store`, free `min`/`max`, which
   work on `SIMD`), with a scalar tail for the `d % W` columns that do not fill
   a vector. `capi.mojo` sets the `vec` flag the kernels branch on: it is on
-  when every row width is a multiple of `W` and off otherwise, so a width of
-  3 or 33 takes a completely scalar path and still matches upstream at the
-  tested tolerances. `tests/test_ops.py` runs both paths at widths 1, 2, 3, 5,
-  7, 8, 16 and 33.
+  when every row width a kernel steps by is a multiple of `W` and off
+  otherwise, so a width of 3 or 33 takes a completely scalar path and still
+  matches upstream at the tested tolerances. `tests/test_ops.py` runs both
+  paths at widths 1, 2, 3, 5, 7, 8, 16 and 33.
 - **`gspmm` reduces a whole vector of columns at a time.** Upstream's loop
   shape is column-outer, edge-inner, which makes every one of the 32M
   (edge, column) pairs its own scalar gather. The accumulator runs across the
   columns of one destination, so a gathered row feeds all 8 vectors at once.
+- **`edge_softmax` walks each node's CSR row once for all heads.** The head
+  axis is the inner loop, `W` lanes at a time over the contiguous `d`-wide
+  logit row, and the running max and sum live in a two-`d` scratch row the
+  caller owns — so a node's row is traversed once per pass instead of once per
+  head, and a head is a vector load rather than a scalar gather. One head
+  still takes a separate path: with a single column the max and the sum stay
+  in registers, and routing it through the scratch cost 1.7x, so `d == 1` is
+  dispatched to the register version. `tests/test_ops.py` runs the multi-head
+  path at 1, 3, 4 and 8 heads, for both `norm_by`, with and without an `eids`
+  subset.
+- **`gather_mm`'s inner product is a vector loop over the output columns.**
+  The contraction is over `k` and the output is over `j`, so a `W`-wide load
+  takes `W` adjacent output columns of one `b` row at once — a quarter of the
+  loads the scalar form issued, over the same `d1 * d2` block, which stays in
+  L1 for the whole row. The `b` block is *not* re-read per output column.
+- **`gather_mm` picks its route on the size of the `b` block, not on `N`.**
+  Two routes compute the same product: the fused kernel streams `a` and `dst`
+  and gathers the block per row; the sorted route permutes the rows by
+  `idx_b` so rows sharing a block walk it once, but pays a random-access
+  gather of `a` and a random-access scatter of the result on top. At 1M rows
+  and 64 blocks the fused kernel is 4.6x ahead at 16x16, 1.6x at 32x32, 1.2x
+  at 64x32 and 64x64, and level at 128x128; the sorted route only takes it at
+  256x256, where the block is 32 MB and no longer survives in cache. The cut
+  sits at 16384 doubles. Upstream's own cut is on `N` and `D1`/`D2 > 8`, which
+  sends 16x16 to the sorted route; that choice is a performance one and
+  `tests/test_ops.py` pins both routes to the same numbers.
 - **The op and reducer dispatch is compile-time.** `op` and `reduce_op` are
   parameters of a generic `def`, not `Int` arguments compared inside the inner
   loop, so `_gspmm` is instantiated once per (message op, reducer) pair and
@@ -191,36 +252,88 @@ ratio as an order of magnitude, not a measurement of the code.
   and handing a second full pass to numpy. Same IEEE division, same result.
 - **`edge_softmax` skips the per-edge select when `eids` is `ALL`.** The
   Python side says so in one `Int` and the mask load disappears from all three
-  passes; the mask array itself is still what a subset selection uses.
+  passes; the mask array itself is not even allocated on that path, and a
+  subset selection is what builds one.
 - **Less redundant work around the kernels.** The two gathered CSR views are
   built once in `_build_csr` instead of being re-gathered from the edge list on
   every call (a 1M-element fancy index each time), and the outputs that the
   kernel writes in full are `np.empty` rather than `np.zeros`.
 
-Two things were tried and dropped because they did not measure faster:
-unrolling the `gspmm` gather loop to get more cache misses in flight, and a
-horizontal reduction per vector inside the dot product (`reduce_add` is a
-handful of shuffles, so at the contraction widths used here it lost to a
-vector accumulator reduced once per edge). Two more stayed scalar on purpose:
+One kernel is scalar on purpose, and the code says why:
 `replace_inf_with_zero`, because this dialect's SIMD comparison folds to a
-single `Bool` rather than a lane mask and there is no `simd_select` to zero one
-lane with, and `gather_mm`, which is a small-matrix gather that vectorises
-badly. `W` is 4 on this AVX2 machine; there is no AVX-512 to ask for.
+single `Bool` rather than a lane mask and there is no `simd_select` to zero
+one lane with. `gsddmm`'s `dot` accumulates a whole vector of partial products
+and does one `reduce_add` per edge instead of one per vector; `W` is 4 on this
+AVX2 machine and there is no AVX-512 to ask for.
 
-### Parallelism and the GPU: neither, on purpose
+### What was tried and did not pay
 
-- **No parallelism.** `parallelize` is gone from this toolchain
-  (`from std.algorithm import parallelize` fails with "package 'algorithm'
-  does not contain 'parallelize'"), there is no `std.parallelism` or
-  `std.threading`, and there is no `max` package to import at all
-  (`import max` -> "unable to locate module 'max'"). There is no replacement
-  to put behind a size threshold, so the work stays serial.
-- **No GPU path.** This toolchain has no `std.gpu` and no `std.gpu.host` at
-  all -- `from std.gpu import thread_idx` fails to resolve, let alone
-  `DeviceContext`, `enqueue_create_buffer` or `synchronize`. The box does have
-  an NVIDIA GeForce RTX 5090, so this is not a memory decision: the host API
-  to launch a kernel does not exist here, and a GPU path that cannot be built
-  and run is not worth shipping. The port is CPU-only.
+Each of these was built, measured with `pixi run bench`'s lock, and reverted
+because it was not faster; the code is as it was found.
+
+- **`gspmm` with the edge loop outside the column loop** (the accumulator a
+  caller-owned `dout` row, so one in-edge contributes all its columns before
+  the next starts). Theoretically more loads in flight, measured 1.26x-1.41x
+  *slower*: the L1 round trip on the accumulator costs more than the index
+  loads it saves.
+- **`gspmm` unrolled 2x and 4x over columns** (two or four reduction chains,
+  one index load for all of them). 2x was 0.97x-1.03x, i.e. noise; 4x spilled
+  registers and was 1.21x-1.46x slower.
+- **`gspmm` pairing two destinations** so two independent chains run at once.
+  0.96x-1.01x. The wall is memory, not instructions: at `d = 32` the kernel
+  already moves 563 MB in the time `gsddmm` moves 768 MB, and both sit at the
+  single-core random-gather bandwidth of this box. More instruction-level
+  parallelism does not buy more memory-level parallelism here, and
+  `gsddmm` reaches its 7 GB/s only because it is edge-parallel with no
+  reduction, so it can issue a whole gathered row at once.
+
+
+`segment_reduce` and `segment_softmax` were left alone deliberately. Both are
+one sequential scan over 256 MB of value rows with a cheap inner body, and
+`segment_softmax` is additionally bound by 32M `exp` calls: a single
+`np.exp` pass over the same array costs more than the kernel's three passes
+put together, so there is no room for a fusion to recover.
+
+### Parallelism and the GPU
+
+- **Parallelism is available and used, but does not pay here.** `parallelize`
+  is no longer in `std` on this toolchain; it lives in the `max` package, which
+  this environment now depends on (`max = "==26.7.0.dev2026092905"`, released in
+  lockstep with the `mojo` pin):
+
+  ```mojo
+  from max.algorithm import parallelize
+
+  def work(i: Int) {imm}:      # a plain nested `def`, not a `@parameter`
+      ...
+  parallelize(work, workers, workers)
+  ```
+
+  Two details from `MOJO_NOTES.md` section 5b both bite: the `[func]` form no
+  longer type-checks, and a `@parameter` closure is rejected as `capturing thin`.
+  It works, and on a bandwidth-bound elementwise kernel it scales — a
+  10M-double `dst[i] = src[i] * 2.0` measured 24.2 ms at one worker and
+  14.1 ms at sixteen, 1.7x, on this box.
+
+  It does **not** pay on these kernels, and that is a measurement, not an
+  excuse. Splitting `gspmm` over destination nodes and running it at 1, 2, 4,
+  8, 16, 32 and 64 workers measured 90.8, 89.7, 88.1, 92.5, 89.1, 90.0 and
+  90.1 ms — flat. The reason is that `gspmm`, `gsddmm` and the segment
+  operators are all memory-bound on random gathers, and the box was carrying a
+  load average of 85 against 72 cores for the whole measurement, so the extra
+  workers had no idle cores to run on and no spare memory bandwidth to
+  contend for. Adding threads to a kernel that is already at the single-core
+  random-gather bandwidth cannot help, and the evidence above says so directly.
+  The parallel form is therefore left out of the shipped kernels rather than
+  committed on the strength of a flag that measures flat.
+- **No GPU path.** The GPU surface moved out of `std` into the same `max`
+  package, so `from std.gpu import thread_idx` no longer resolves, but
+  `from max.gpu import block_idx, thread_idx` and
+  `from max.gpu.host import DeviceContext` do. The box does have an NVIDIA GPU.
+  A GPU path is still not shipped: these kernels run at roughly 1-2 flops per
+  byte, they are already at the machine's memory bandwidth, and a
+  copy-in/copy-out path would move the same bytes twice. The port is CPU-only,
+  and that is a bandwidth argument rather than a missing-API one.
 
 ## How it works
 
@@ -231,11 +344,12 @@ layer whose only job is rebuilding pointers from the addresses Python hands
 over, because `@export` refuses a parameterised function and a pointer with an
 inferred origin is parameterised. Python reaches the library through
 `python/mojodgl/_lib.py`, a ctypes table of the ten exported symbols with
-their `Int`-address argument lists. No symbol allocates: every buffer, including
-scratch like the segment offsets and the two `d`-long rows `segment_softmax`
-reduces into, is a numpy array the caller owns, so there is nothing to free and
-nothing to leak. `capi.mojo` is also where the `vec` flag is decided, since it
-is the only layer that still has the addresses.
+their `Int`-address argument lists. No symbol allocates: every buffer,
+including scratch like the segment offsets, `segment_softmax`'s two `d`-long
+rows and `edge_softmax`'s max-and-sum row, is a numpy array the caller owns,
+so there is nothing to free and nothing to leak. `capi.mojo` is also where the
+`vec` flag is decided, since it is the only layer that still has the
+addresses.
 
 **Memory layout.** Everything is C-contiguous `float64`; a feature block is `n`
 rows of `d` columns and crosses as one flat address with `n` and `d` passed
@@ -256,7 +370,8 @@ element into their allocation.
 the in-edge CSR that gathers the source feature, combines it with the edge
 feature and reduces on the spot, so the per-edge message never exists as an
 array. `gsddmm` is the complement — edge-parallel, no reduction, and the basis
-for every `u_op_v` / `v_op_e` message. `edge_softmax` is a fused three-pass scan
-per node (max, exp and sum, divide) over the same CSR. The segment operators
-take an offsets array, which is exactly the `cumsum` of the segment lengths that
-`dgl/ops/segment.py` builds in Python.
+for every `u_op_v` / `v_op_e` message. `edge_softmax` is a fused three-pass
+scan per node (max, exp and sum, divide) whose inner loop is the head axis, so
+one pass covers every head. The segment operators take an offsets array, which
+is exactly the `cumsum` of the segment lengths that `dgl/ops/segment.py` builds
+in Python.

@@ -68,6 +68,18 @@ def _broadcast(a, d, n_expected=None):
     return np.repeat(a, d, axis=1)
 
 
+def _check_rows(a, want: int, what: str) -> None:
+    """Reject an operand whose row count its target does not imply.
+
+    Upstream's `check.h` makes the same check before the kernel runs; the
+    kernels themselves index with no bounds test.
+    """
+    if a.shape[0] != want:
+        raise DGLError(
+            "{} data must have {} rows, got {}".format(what, want, a.shape[0])
+        )
+
+
 def gsddmm(g, op, lhs_data, rhs_data, lhs_target="u", rhs_target="v"):
     r"""Generalized Sampled-Dense-Dense Matrix Multiplication interface.
     It computes edge features by :attr:`op` lhs features and rhs features.
@@ -130,12 +142,21 @@ def gsddmm(g, op, lhs_data, rhs_data, lhs_target="u", rhs_target="v"):
             lhs = _broadcast(lhs, d)
             rhs = _broadcast(rhs, d)
             dl = dr = dout = d
+    # an operand is only read for the target it was asked for, so the check is
+    # per operand: node targets want num_nodes rows, the edge target num_edges
+    num_nodes = g.number_of_nodes()
+    if lhs_data is not None:
+        _check_rows(lhs, num_edges if lhs_target == "e" else num_nodes,
+                    "edge" if lhs_target == "e" else "node")
+    if rhs_data is not None:
+        _check_rows(rhs, num_edges if rhs_target == "e" else num_nodes,
+                    "edge" if rhs_target == "e" else "node")
 
+    dst = np.empty((num_edges, dout), dtype=np.float64)
     # The pointers are non-nullable, so a missing operand borrows the other's
     # buffer; its contents are never read on the copy paths.
     lhs_addr = addr(lhs) if lhs.size else addr(rhs)
     rhs_addr = addr(rhs) if rhs.size else addr(lhs)
-    dst = np.empty((num_edges, dout), dtype=np.float64)
     if op == "copy_lhs":
         code = OP_COPY_LHS
     elif op == "copy_rhs":

@@ -28,6 +28,7 @@ from ported import (
     segment_mm,
     segment_reduce,
     segment_softmax,
+    WORKERS,
 )
 
 def p(addr: Int) -> Pointer[Float64, AnyOrigin[mut=True]]:
@@ -40,6 +41,13 @@ def q(addr: Int) -> Pointer[Int, AnyOrigin[mut=True]]:
 
 def r(addr: Int) -> Pointer[Int8, AnyOrigin[mut=True]]:
     return Pointer[Int8, AnyOrigin[mut=True]](unsafe_from_address=addr)
+
+
+# The worker count the kernels split over. Python allocates `edge_softmax`'s
+# per-worker scratch from this rather than hard-coding a second copy.
+@export("mdgl_workers")
+def mdgl_workers() abi("C") -> Int:
+    return WORKERS
 
 
 # ------------------------------------------------------------------- array
@@ -146,11 +154,14 @@ def mdgl_edge_softmax_(
     mask: Int,
     logits: Int,
     dst: Int,
+    scratch: Int,
     num_nodes: Int,
     all_ones: Int,
+    d: Int,
 ) abi("C"):
     edge_softmax_(
-        q(indptr), q(indices), q(eid), r(mask), p(logits), p(dst), num_nodes, all_ones
+        q(indptr), q(indices), q(eid), r(mask), p(logits), p(dst), p(scratch),
+        num_nodes, all_ones, d,
     )
 
 

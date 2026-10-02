@@ -20,7 +20,8 @@ remainder is the scalar tail. When it is false the kernels run the scalar
 path end to end.
 """
 
-from std.math import exp
+from max.algorithm import parallelize
+from std.math import exp, inf
 from std.sys import simd_width_of
 
 comptime FP = Pointer[Float64, AnyOrigin[mut=True]]
@@ -29,6 +30,16 @@ comptime BP = Pointer[Int8, AnyOrigin[mut=True]]
 
 comptime W = simd_width_of[DType.float64]()
 comptime VW = SIMD[DType.float64, W]
+
+# Worker count and the work threshold below which a kernel stays serial. Every
+# feature kernel here partitions over its own output axis -- destination node,
+# edge, node, segment, row -- and no output element reads another, so a chunk
+# boundary changes nothing about the value computed. That is why the split is
+# exact rather than approximate. Python reads `WORKERS` back through the
+# `mdgl_workers` export to size the per-worker scratch rows.
+comptime WORKERS: Int = 32
+# Below this many output elements the launch itself costs more than the work.
+comptime PARALLEL_MIN: Int = 4096
 
 # `dgl/function/base.py` :: TargetCode
 comptime SRC: Int = 0
@@ -53,8 +64,8 @@ comptime REDUCE_MAX: Int = 1
 comptime REDUCE_MIN: Int = 2
 comptime REDUCE_MEAN: Int = 3
 
-comptime NEG_INF: Float64 = -1.7976931348623157e308
-comptime POS_INF: Float64 = 1.7976931348623157e308
+comptime NEG_INF: Float64 = -inf[DType.float64]()
+comptime POS_INF: Float64 = inf[DType.float64]()
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +155,21 @@ def cumsum(src: IP, dst: IP, n: Int) -> None:
 # Scalar: this dialect's SIMD comparison folds to a single Bool rather than a
 # lane mask, so there is no vector select to zero one lane with.
 def replace_inf_with_zero(src: FP, dst: FP, n: Int) -> None:
-    var i = 0
-    while i < n:
+    # Element i depends only on element i, so the split over `[i0, i1)` is exact.
+    if n >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var i0 = n * task // WORKERS
+            var i1 = n * (task + 1) // WORKERS
+            _riwz_range(src, dst, i0, i1)
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _riwz_range(src, dst, 0, n)
+
+
+def _riwz_range(src: FP, dst: FP, i0: Int, i1: Int) -> None:
+    var i = i0
+    while i < i1:
         var v = src.unsafe_load(i)
         if v == POS_INF or v == NEG_INF:
             v = 0.0
@@ -192,8 +216,43 @@ def gsddmm(
     dout: Int,
     vec: Bool,
 ) -> None:
-    var e = 0
-    while e < num_edges:
+    # Each edge writes one output row and reads only the two gathered operand
+    # rows, so the split over `[e0, e1)` is exact.
+    if num_edges >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var e0 = num_edges * task // WORKERS
+            var e1 = num_edges * (task + 1) // WORKERS
+            _gsddmm_range(
+                uids, vids, lhs, rhs, dst, e0, e1, lhs_target, rhs_target, op, dl,
+                dr, dout, vec
+            )
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _gsddmm_range(
+            uids, vids, lhs, rhs, dst, 0, num_edges, lhs_target, rhs_target, op, dl,
+            dr, dout, vec
+        )
+
+
+def _gsddmm_range(
+    uids: IP,
+    vids: IP,
+    lhs: FP,
+    rhs: FP,
+    dst: FP,
+    e0: Int,
+    e1: Int,
+    lhs_target: Int,
+    rhs_target: Int,
+    op: Int,
+    dl: Int,
+    dr: Int,
+    dout: Int,
+    vec: Bool,
+) -> None:
+    var e = e0
+    while e < e1:
         # src/array/kernel/sddmm.cc gathers through a target-coded index map
         var li = 0
         if lhs_target == SRC:
@@ -285,8 +344,10 @@ def gsddmm(
 # so a whole vector of columns is reduced per gathered row instead of one
 # column at a time.
 #
-# Zero in-degree nodes are filled with zero, which is upstream's documented
-# "replace all +/-inf values to zero" behaviour for max and min.
+# A node with no in-edges keeps the reduce identity: zero for sum, -inf for
+# max, +inf for min. That is what `dgl.ops.gspmm` returns, and it is
+# `update_all` — not this kernel — that then replaces those with zero, as
+# upstream's message-passing VM does.
 # ---------------------------------------------------------------------------
 def _gspmm[op: Int, red: Int](
     indptr: IP,
@@ -295,7 +356,8 @@ def _gspmm[op: Int, red: Int](
     lhs: FP,
     rhs: FP,
     dst: FP,
-    num_dst: Int,
+    v0: Int,
+    v1: Int,
     dl: Int,
     dr: Int,
     dout: Int,
@@ -303,8 +365,8 @@ def _gspmm[op: Int, red: Int](
     mean: Bool,
     vec: Bool,
 ) -> None:
-    var v = 0
-    while v < num_dst:
+    var v = v0
+    while v < v1:
         var start = indptr.unsafe_load(v)
         var stop = indptr.unsafe_load(v + 1)
         # `mean` is upstream's sum-then-divide, folded in here so the reduced
@@ -320,10 +382,10 @@ def _gspmm[op: Int, red: Int](
         if start >= stop:
             if vec:
                 while k + W <= dout:
-                    dst.unsafe_store(v * dout + k, VW(0.0))
+                    dst.unsafe_store(v * dout + k, _seed_v[red]())
                     k += W
             while k < dout:
-                dst.unsafe_store(v * dout + k, 0.0)
+                dst.unsafe_store(v * dout + k, _seed[red]())
                 k += 1
             v += 1
             continue
@@ -377,41 +439,77 @@ def gspmm(
     deg: IP,
     vec: Bool,
 ) -> None:
+    # Destination rows are independent, so the split is over `[v0, v1)` and a
+    # chunk boundary does not change any output element.
+    if num_dst >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var v0 = num_dst * task // WORKERS
+            var v1 = num_dst * (task + 1) // WORKERS
+            _gspmm_dispatch(
+                indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, op,
+                reduce_op, deg, vec
+            )
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _gspmm_dispatch(
+            indptr, indices, eid, lhs, rhs, dst, 0, num_dst, dl, dr, dout, op,
+            reduce_op, deg, vec
+        )
+
+
+# One instantiation per (op, reduce) pair: the dispatch below is the whole of
+# the message/reduce functor, and everything under it is a bare load, combine
+# and store.
+def _gspmm_dispatch(
+    indptr: IP,
+    indices: IP,
+    eid: IP,
+    lhs: FP,
+    rhs: FP,
+    dst: FP,
+    v0: Int,
+    v1: Int,
+    dl: Int,
+    dr: Int,
+    dout: Int,
+    op: Int,
+    reduce_op: Int,
+    deg: IP,
+    vec: Bool,
+) -> None:
     if op == OP_ADD:
         _gspmm_op[OP_ADD](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
     elif op == OP_SUB:
         _gspmm_op[OP_SUB](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
     elif op == OP_MUL:
         _gspmm_op[OP_MUL](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
     elif op == OP_DIV:
         _gspmm_op[OP_DIV](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
     elif op == OP_COPY_LHS:
         _gspmm_op[OP_COPY_LHS](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
     else:
         _gspmm_op[OP_COPY_RHS](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, reduce_op, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, reduce_op, deg,
             vec
         )
 
 
-# One instantiation per (op, reduce) pair: the dispatch above is the whole of
-# the message/reduce functor, and everything below it is a bare load, combine
-# and store.
 def _gspmm_op[op: Int](
     indptr: IP,
     indices: IP,
@@ -419,7 +517,8 @@ def _gspmm_op[op: Int](
     lhs: FP,
     rhs: FP,
     dst: FP,
-    num_dst: Int,
+    v0: Int,
+    v1: Int,
     dl: Int,
     dr: Int,
     dout: Int,
@@ -429,22 +528,22 @@ def _gspmm_op[op: Int](
 ) -> None:
     if reduce_op == REDUCE_MAX:
         _gspmm[op, REDUCE_MAX](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, deg,
             False, vec
         )
     elif reduce_op == REDUCE_MIN:
         _gspmm[op, REDUCE_MIN](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, deg,
             False, vec
         )
     elif reduce_op == REDUCE_MEAN:
         _gspmm[op, REDUCE_SUM](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, deg,
             True, vec
         )
     else:
         _gspmm[op, REDUCE_SUM](
-            indptr, indices, eid, lhs, rhs, dst, num_dst, dl, dr, dout, deg,
+            indptr, indices, eid, lhs, rhs, dst, v0, v1, dl, dr, dout, deg,
             False, vec
         )
 
@@ -467,8 +566,34 @@ def segment_reduce(
     n: Int,
     vec: Bool,
 ) -> None:
-    var s = 0
-    while s < num_seg:
+    # Each segment writes one output row and reads only its own input rows, so
+    # the split over `[s0, s1)` is exact.
+    if num_seg >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var s0 = num_seg * task // WORKERS
+            var s1 = num_seg * (task + 1) // WORKERS
+            _seg_reduce_range(
+                offsets, value, dst, s0, s1, d, reduce_op, n, vec
+            )
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _seg_reduce_range(offsets, value, dst, 0, num_seg, d, reduce_op, n, vec)
+
+
+def _seg_reduce_range(
+    offsets: IP,
+    value: FP,
+    dst: FP,
+    s0: Int,
+    s1: Int,
+    d: Int,
+    reduce_op: Int,
+    n: Int,
+    vec: Bool,
+) -> None:
+    var s = s0
+    while s < s1:
         var start = offsets.unsafe_load(s)
         var stop = offsets.unsafe_load(s + 1)
         # A descending or out-of-range offsets array would otherwise let the
@@ -535,8 +660,35 @@ def segment_reduce(
 def segment_softmax(
     offsets: IP, value: FP, dst: FP, scratch: FP, num_seg: Int, d: Int, n: Int, vec: Bool
 ) -> None:
-    var s = 0
-    while s < num_seg:
+    # Each segment reads and writes only its own rows, and each worker gets its
+    # own pair of `d`-long scratch rows, so the split over `[s0, s1)` is exact.
+    if num_seg >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var s0 = num_seg * task // WORKERS
+            var s1 = num_seg * (task + 1) // WORKERS
+            _seg_softmax_range(
+                offsets, value, dst, scratch.unsafe_offset(task * 2 * d), s0, s1, d,
+                n, vec
+            )
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _seg_softmax_range(offsets, value, dst, scratch, 0, num_seg, d, n, vec)
+
+
+def _seg_softmax_range(
+    offsets: IP,
+    value: FP,
+    dst: FP,
+    scratch: FP,
+    s0: Int,
+    s1: Int,
+    d: Int,
+    n: Int,
+    vec: Bool,
+) -> None:
+    var s = s0
+    while s < s1:
         var start = offsets.unsafe_load(s)
         var stop = offsets.unsafe_load(s + 1)
         if start < 0:
@@ -632,11 +784,11 @@ def segment_mm(
                     var vacc = VW(0.0)
                     var k = 0
                     while k < d1:
-                        vacc += a.unsafe_load(row * d1 + k) * b.unsafe_load[
+                        vacc += VW(a.unsafe_load(row * d1 + k)) * b.unsafe_load[
                             width=W
                         ]((seg * d1 + k) * d2 + j)
                         k += 1
-                    dst.unsafe_store(row * d2 + j, vacc.reduce_add())
+                    dst.unsafe_store[width=W](row * d2 + j, vacc)
                     j += W
             while j < d2:
                 var acc: Float64 = 0.0
@@ -663,7 +815,64 @@ def segment_mm(
 # subtracted before the exponential, as in upstream's fused kernel. `all_ones`
 # says the mask is the all-ones selection, which lets the per-edge select
 # disappear from all three passes.
+
+# Upstream's logits are (E, *, 1): every trailing column past the edge axis is
+# one independent softmax, which is how a multi-head attention layer calls it.
+# The node is the outer loop and the head is the inner one, so one walk of a
+# node's CSR row covers every head instead of one walk per head; the row's
+# running max and sum live in `scratch`, two `d`-long rows the caller owns and
+# only one node needs at a time. A head is `W` lanes at a time, with a scalar
+# tail for the `d % W` columns that do not fill a vector, so the per-edge body
+# is a contiguous vector of the row rather than a scalar gather.
 # ---------------------------------------------------------------------------
+def _es_max_row(logits: FP, o: Int, mx: FP, sb: Int, d: Int) -> None:
+    var h = 0
+    while h + W <= d:
+        mx.unsafe_store(sb + h, max(mx.unsafe_load[width=W](sb + h), logits.unsafe_load[width=W](o + h)))
+        h += W
+    while h < d:
+        mx.unsafe_store(sb + h, max(mx.unsafe_load(sb + h), logits.unsafe_load(o + h)))
+        h += 1
+
+
+def _es_exp_row(logits: FP, dst: FP, o: Int, scratch: FP, sb: Int, d: Int) -> None:
+    var h = 0
+    while h + W <= d:
+        var v = exp(
+            logits.unsafe_load[width=W](o + h) - scratch.unsafe_load[width=W](sb + h)
+        )
+        dst.unsafe_store(o + h, v)
+        scratch.unsafe_store(sb + d + h, scratch.unsafe_load[width=W](sb + d + h) + v)
+        h += W
+    while h < d:
+        var v = exp(logits.unsafe_load(o + h) - scratch.unsafe_load(sb + h))
+        dst.unsafe_store(o + h, v)
+        scratch.unsafe_store(sb + d + h, scratch.unsafe_load(sb + d + h) + v)
+        h += 1
+
+
+def _es_div_row(dst: FP, o: Int, scratch: FP, sb: Int, d: Int) -> None:
+    var h = 0
+    while h + W <= d:
+        dst.unsafe_store(
+            o + h, dst.unsafe_load[width=W](o + h) / scratch.unsafe_load[width=W](sb + d + h)
+        )
+        h += W
+    while h < d:
+        dst.unsafe_store(o + h, dst.unsafe_load(o + h) / scratch.unsafe_load(sb + d + h))
+        h += 1
+
+
+def _es_zero_row(dst: FP, o: Int, d: Int) -> None:
+    var h = 0
+    while h + W <= d:
+        dst.unsafe_store(o + h, VW(0.0))
+        h += W
+    while h < d:
+        dst.unsafe_store(o + h, 0.0)
+        h += 1
+
+
 def edge_softmax_(
     indptr: IP,
     indices: IP,
@@ -671,11 +880,149 @@ def edge_softmax_(
     mask: BP,
     logits: FP,
     dst: FP,
+    scratch: FP,
+    num_nodes: Int,
+    all_ones: Int,
+    d: Int,
+) -> None:
+    # `d == 1` keeps its own scalar kernel: with a single column the running max
+    # and sum stay in registers, and routing it through scratch measured slower.
+    if d == 1:
+        _es_one_head(indptr, eid, mask, logits, dst, num_nodes, all_ones)
+        return
+    # Nodes are independent, and each worker gets its own pair of `d`-long
+    # scratch rows, so the split over `[i0, i1)` is exact.
+    if num_nodes >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var i0 = num_nodes * task // WORKERS
+            var i1 = num_nodes * (task + 1) // WORKERS
+            _es_range(
+                indptr,
+                eid,
+                mask,
+                logits,
+                dst,
+                scratch.unsafe_offset(task * 2 * d),
+                i0,
+                i1,
+                all_ones, d
+            )
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _es_range(
+            indptr, eid, mask, logits, dst, scratch, 0, num_nodes, all_ones, d
+        )
+
+
+def _es_range(
+    indptr: IP,
+    eid: IP,
+    mask: BP,
+    logits: FP,
+    dst: FP,
+    scratch: FP,
+    i0: Int,
+    i1: Int,
+    all_ones: Int,
+    d: Int,
+) -> None:
+    var i = i0
+    while i < i1:
+        var start = indptr.unsafe_load(i)
+        var stop = indptr.unsafe_load(i + 1)
+        if start < stop:
+            var h = 0
+            while h < d:
+                scratch.unsafe_store(h, NEG_INF)
+                h += 1
+            var any = False
+            var j = start
+            if all_ones == 1:
+                while j < stop:
+                    _es_max_row(logits, eid.unsafe_load(j) * d, scratch, 0, d)
+                    any = True
+                    j += 1
+            else:
+                while j < stop:
+                    var e = eid.unsafe_load(j)
+                    if mask.unsafe_load(e) == 1:
+                        _es_max_row(logits, e * d, scratch, 0, d)
+                        any = True
+                    j += 1
+            if any:
+                h = 0
+                while h < d:
+                    scratch.unsafe_store(d + h, 0.0)
+                    h += 1
+                j = start
+                if all_ones == 1:
+                    while j < stop:
+                        _es_exp_row(logits, dst, eid.unsafe_load(j) * d, scratch, 0, d)
+                        j += 1
+                else:
+                    while j < stop:
+                        var e = eid.unsafe_load(j)
+                        if mask.unsafe_load(e) == 1:
+                            _es_exp_row(logits, dst, e * d, scratch, 0, d)
+                        j += 1
+                j = start
+                if all_ones == 1:
+                    while j < stop:
+                        _es_div_row(dst, eid.unsafe_load(j) * d, scratch, 0, d)
+                        j += 1
+                else:
+                    while j < stop:
+                        var e = eid.unsafe_load(j)
+                        if mask.unsafe_load(e) == 1:
+                            _es_div_row(dst, e * d, scratch, 0, d)
+                        j += 1
+            else:
+                j = start
+                while j < stop:
+                    var e = eid.unsafe_load(j)
+                    if all_ones == 1 or mask.unsafe_load(e) == 1:
+                        _es_zero_row(dst, e * d, d)
+                    j += 1
+        i += 1
+
+
+# The single-column form keeps the running max and sum in registers instead of
+# in the scratch rows: with one column there is nothing for a `d`-long scratch
+# row to carry, and routing it through scratch measured slower. Nodes are still
+# independent, so it splits over nodes the same way.
+def _es_one_head(
+    indptr: IP,
+    eid: IP,
+    mask: BP,
+    logits: FP,
+    dst: FP,
     num_nodes: Int,
     all_ones: Int,
 ) -> None:
-    var i = 0
-    while i < num_nodes:
+    if num_nodes >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var i0 = num_nodes * task // WORKERS
+            var i1 = num_nodes * (task + 1) // WORKERS
+            _es_one_head_range(indptr, eid, mask, logits, dst, i0, i1, all_ones)
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _es_one_head_range(indptr, eid, mask, logits, dst, 0, num_nodes, all_ones)
+
+
+def _es_one_head_range(
+    indptr: IP,
+    eid: IP,
+    mask: BP,
+    logits: FP,
+    dst: FP,
+    i0: Int,
+    i1: Int,
+    all_ones: Int,
+) -> None:
+    var i = i0
+    while i < i1:
         var start = indptr.unsafe_load(i)
         var stop = indptr.unsafe_load(i + 1)
         var m: Float64 = NEG_INF
@@ -733,21 +1080,51 @@ def edge_softmax_(
         i += 1
 
 
-# ---------------------------------------------------------------------------
-# python/dgl/ops/gather_mm.py :: gather_mm
-#   c[i] = a[i] @ b[idx_b[i]]
+# The contraction is over `k` and the output is over `j`, so a `W`-wide load
+# takes `W` adjacent output columns of one `b` row at a time and accumulates
+# them as `W` partial sums, which are then stored as a vector. The `b` block a
+# row walks is `d1 * d2` doubles and stays in L1 across the whole row, so this
+# touches the same memory the scalar form did with a quarter of the loads.
 # ---------------------------------------------------------------------------
 def gather_mm(a: FP, b: FP, idx_b: IP, dst: FP, n: Int, d1: Int, d2: Int) -> None:
-    var i = 0
-    while i < n:
+    # Each row writes its own output block and reads only its own `a` row and
+    # its own `b` block, so the split over `[i0, i1)` is exact.
+    if n >= PARALLEL_MIN:
+        def work(task: Int) {`imm`}:
+            var i0 = n * task // WORKERS
+            var i1 = n * (task + 1) // WORKERS
+            _gather_mm_range(a, b, idx_b, dst, i0, i1, d1, d2)
+
+        parallelize(work, WORKERS, WORKERS)
+    else:
+        _gather_mm_range(a, b, idx_b, dst, 0, n, d1, d2)
+
+
+def _gather_mm_range(
+    a: FP, b: FP, idx_b: IP, dst: FP, i0: Int, i1: Int, d1: Int, d2: Int
+) -> None:
+    var i = i0
+    while i < i1:
         var o = idx_b.unsafe_load(i) * d1 * d2
+        var arow = i * d1
+        var drow = i * d2
         var j = 0
+        while j + W <= d2:
+            var vacc = VW(0.0)
+            var k = 0
+            while k < d1:
+                vacc += VW(a.unsafe_load(arow + k)) * b.unsafe_load[width=W](
+                    o + k * d2 + j
+                )
+                k += 1
+            dst.unsafe_store[width=W](drow + j, vacc)
+            j += W
         while j < d2:
             var acc: Float64 = 0.0
             var k = 0
             while k < d1:
-                acc += a.unsafe_load(i * d1 + k) * b.unsafe_load(o + k * d2 + j)
+                acc += a.unsafe_load(arow + k) * b.unsafe_load(o + k * d2 + j)
                 k += 1
-            dst.unsafe_store(i * d2 + j, acc)
+            dst.unsafe_store(drow + j, acc)
             j += 1
         i += 1

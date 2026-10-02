@@ -44,13 +44,14 @@ def data():
     x = np.ascontiguousarray(rng.normal(size=(NODES, DIM)))
     e = np.ascontiguousarray(rng.normal(size=(EDGES, DIM)))
     z = np.ascontiguousarray(rng.normal(size=(EDGES, 1)))
+    zh = np.ascontiguousarray(rng.normal(size=(EDGES, 8, 1)))
     g = dgl.graph((u, v))
     g.ndata["h"] = x
     g.edata["e"] = e
     ug = udgl.graph((torch.as_tensor(u), torch.as_tensor(v)))
     ug.ndata["h"] = torch.as_tensor(x)
     ug.edata["e"] = torch.as_tensor(e)
-    _CACHE["main"] = (g, ug, x, e, z)
+    _CACHE["main"] = (g, ug, x, e, z, zh)
     return _CACHE["main"]
 
 
@@ -159,6 +160,12 @@ def _():
             lambda: uops.edge_softmax(ug, t(z), norm_by="src"))
 
 
+@case("edge_softmax 8 heads (1M edges, (E, 8, 1))")
+def _():
+    g, ug, _, _, _, zh = data()
+    return (lambda: ops.edge_softmax(g, zh),
+            lambda: uops.edge_softmax(ug, t(zh)))
+
 @case("segment_reduce sum (1M rows, 32d, 200k segments)")
 def _():
     seglen, sv = segment_data()
@@ -247,4 +254,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--locked" in sys.argv:
+        # The caller already holds /tmp/mojo-bench.lock; do not queue again.
+        main()
+    else:
+        raise SystemExit(
+            "run this through `pixi run bench`, which takes the machine-wide "
+            "lock so concurrent factory jobs cannot distort the numbers"
+        )

@@ -82,3 +82,13 @@ def test_feature_store_rejects_wrong_row_count():
         g.ndata["h"] = np.ones((2, 3))
     with pytest.raises(KeyError):
         g.ndata["missing"]
+
+
+def test_empty_graph_infers_zero_nodes():
+    """Upstream's inferred node count for no edges is 0, not 1."""
+    empty = np.array([], dtype=np.int64)
+    ours = dgl_mojo.graph((empty, empty))
+    theirs = dgl.graph((ti(empty), ti(empty)))
+    assert ours.num_nodes() == theirs.num_nodes() == 0
+    assert ours.num_edges() == theirs.num_edges() == 0
+    np.testing.assert_array_equal(ours.in_degrees(), np.asarray(theirs.in_degrees()))

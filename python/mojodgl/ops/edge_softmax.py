@@ -32,7 +32,8 @@ def edge_softmax(graph, logits, eids=ALL, norm_by="dst"):
     graph : DGLGraph
         The graph over which edge softmax will be performed.
     logits : numpy.ndarray
-        The input edge feature, of shape ``(E,)`` or ``(E, 1)``.
+        The input edge feature, of shape ``(E,)``, ``(E, 1)`` or ``(E, *, 1)``.
+        Every trailing column is an independent softmax, as upstream.
     eids : numpy.ndarray or ALL, optional
         The IDs of the edges to apply edge softmax. If ALL, it will apply edge
         softmax to all edges in the graph. Default: ALL.
@@ -59,21 +60,20 @@ def edge_softmax(graph, logits, eids=ALL, norm_by="dst"):
     """
     num_edges = graph.number_of_edges()
     logits = f64(logits)
-    keep_2d = logits.ndim == 2
-    if keep_2d:
-        if logits.shape[1] != 1:
-            raise DGLError(
-                "this port handles 1-D or (E, 1) edge logits only, got shape {}".format(
-                    logits.shape
-                )
-            )
-        logits = logits.reshape(-1)
-    elif logits.ndim != 1:
+    shape = logits.shape
+    # upstream's shape is (E, *, 1): the edge axis, any number of trailing
+    # columns, each its own softmax, and a final axis of one. A bare (E,) is the
+    # same thing with no trailing columns. The column count is spelled out
+    # rather than left to a -1, which a zero-edge array cannot resolve.
+    if len(shape) == 1:
+        d = 1
+    elif len(shape) >= 2 and shape[-1] == 1:
+        d = int(np.prod(shape[1:]))
+    else:
         raise DGLError(
-            "this port handles 1-D or (E, 1) edge logits only, got shape {}".format(
-                logits.shape
-            )
+            "logits must be (E,), (E, 1) or (E, *, 1); got shape {}".format(shape)
         )
+    logits = logits.reshape(shape[0], d)
     if norm_by == "dst":
         indptr, indices, eid = graph._in_csr()
         num_nodes = graph.number_of_nodes()
@@ -107,17 +107,67 @@ def edge_softmax(graph, logits, eids=ALL, norm_by="dst"):
                 order.size, out_len
             )
         )
-    mask = np.ones(num_edges, dtype=np.int8)
-    if order is not None:
-        mask[:] = 0
-        mask[order] = 1
-    dst = np.empty(num_edges, dtype=np.float64)
+    if order is None:
+        # `eids` is ALL: the CSR is the whole graph's, and it is walked in edge
+        # id order, so `eid` is the identity and `mask` is never read.
+        row_ids = eid
+        row_ptr = indptr
+        row_off = indices
+        all_ones = 1
+        mask = np.ones(1, dtype=np.int8)
+        num_rows = num_nodes
+    else:
+        # Upstream does not mask the graph's CSR. It rebuilds one from the
+        # selection, and that rebuild indexes `logits` by POSITION in `eids`
+        # rather than by edge id: `Edge_softmax_forward` calls `CalcBcastOff`
+        # and then `Edge_softmax_csr_forward` on a CSRMatrix whose row length is
+        # the number of selected edges sharing that endpoint, so row `i` of the
+        # kernel sees `logits[i]` rather than `logits[eids[i]]`. The result is
+        # indexed by position too.
+        #
+        # Reproduced exactly: group the selection's POSITIONS by endpoint, keep
+        # them in the order they appear in `eids`, and read the logit of
+        # position `i` from `logits[i]`. Both `norm_by` share the bug, because
+        # the two directions differ only in which endpoint is the group key.
+        uids, vids = graph._edge_arrays()
+        key = vids if norm_by == "dst" else uids
+        pos_of_node = {}
+        row_order = []
+        row_ptr = [0]
+        for i, e in enumerate(order.tolist()):
+            n = int(key[e])
+            if n not in pos_of_node:
+                pos_of_node[n] = []
+            pos_of_node[n].append(i)
+        for n in sorted(pos_of_node):
+            grp = pos_of_node[n]
+            row_order.extend(grp)
+            row_ptr.append(row_ptr[-1] + len(grp))
+        row_order = np.array(row_order, dtype=np.int64)
+        row_ptr = np.array(row_ptr, dtype=np.int64)
+        num_rows = len(pos_of_node)
+        # `indices` are the CSR's neighbour slots and are not read on this path;
+        # `eid` and `mask` both become the position itself, which is what the
+        # kernel uses to find the logit row and to decide membership.
+        row_off = row_order
+        row_ids = row_order
+        all_ones = 1
+        mask = np.ones(1, dtype=np.int8)
+        # upstream reads the selection, so the logit block it reduces over is
+        # the first `len(eids)` rows of `logits`.
+        logits = logits[: order.size]
+    dst = np.empty((num_edges, d), dtype=np.float64)
+    workers = lib().mdgl_workers()
+    # Two `d`-long rows per worker for the kernel to reduce into: the
+    # per-column max, then the running exponential sum for the node it is on.
+    # One node at a time is enough per worker, and the workers split the nodes.
+    scratch = np.empty(workers * 2 * d, dtype=np.float64)
     lib().mdgl_edge_softmax_(
-        addr(indptr), addr(indices), addr(eid), addr(mask), addr(logits), addr(dst),
-        num_nodes, 1 if order is None else 0,
+        addr(row_ptr), addr(row_off), addr(row_ids), addr(mask), addr(logits),
+        addr(dst), addr(scratch), num_rows, all_ones, d,
     )
     if order is not None:
-        picked = np.zeros(out_len, dtype=np.float64)
-        picked[: order.size] = dst[order]
+        picked = np.zeros((out_len, d), dtype=np.float64)
+        picked[: order.size] = dst[: order.size]
         dst = picked
-    return dst.reshape(-1, 1) if keep_2d else dst
+    return dst.reshape(shape)

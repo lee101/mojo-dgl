@@ -16,3 +16,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/mojodgl"]
+
+# The Mojo sources ship inside the package so that a wheel-only install can
+# still build the shared library on first import; `mojodgl._lib` looks for them
+# at `mojodgl/mojo/`.
+[tool.hatch.build.targets.wheel.force-include]
+"src" = "mojodgl/mojo"

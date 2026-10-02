@@ -13,7 +13,7 @@ from .._lib import (
     lib,
 )
 from ..base import DGLError
-from .sddmm import _broadcast, _flat, reshape_lhs_rhs
+from .sddmm import _broadcast, _check_rows, _flat, reshape_lhs_rhs
 
 __all__ = ["gspmm"]
 
@@ -87,6 +87,18 @@ def gspmm(g, op, reduce_op, lhs_data, rhs_data):
         code = OP_COPY_RHS
     else:
         code = BINARY_OPS[op]
+    # upstream's check.h rejects an operand whose row count is not the one its
+    # role implies; the kernel would read past the end of the array instead.
+    # A copy op carries one array, node data for copy_lhs and edge data for
+    # copy_rhs; a binary op carries both.
+    num_edges = g.number_of_edges()
+    if code == OP_COPY_LHS:
+        _check_rows(lhs, num_dst, "node")
+    elif code == OP_COPY_RHS:
+        _check_rows(rhs, num_edges, "edge")
+    else:
+        _check_rows(lhs, num_dst, "node")
+        _check_rows(rhs, num_edges, "edge")
     ret = np.empty((num_dst, dout), dtype=np.float64)
     # `mean` divides by the in-degree inside the kernel, so the reduced row is
     # written once instead of being handed back to numpy for a second pass.

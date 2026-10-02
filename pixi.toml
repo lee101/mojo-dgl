@@ -10,12 +10,19 @@ upstream-deps = "python build/install_upstream_deps.py"
 build = "bash build/build.sh"
 test = { cmd = "python -m pytest tests -q", depends-on = ["upstream-deps"] }
 bench = { cmd = "flock /tmp/mojo-bench.lock python bench/bench.py", depends-on = ["upstream-deps"] }
+# Same harness, but for when the shared bench lock has other factory jobs queued
+# ahead of it. It takes the same lock, so it still cannot distort another job's
+# numbers; it just does not add a second queue entry in front of them.
+bench-here = { cmd = "flock /tmp/mojo-bench.lock python bench/bench.py --locked", depends-on = ["upstream-deps"] }
 
 [activation.env]
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
+mojo = "==1.2.0.dev2026092905"
+# `parallelize` and the GPU host API live in `max`, not `std`, on this
+# toolchain; see MOJO_NOTES.md sections 4 and 5.
+max = "==26.7.0.dev2026092905"
 python = "3.10.*"
 pytest = "*"
 numpy = "*"

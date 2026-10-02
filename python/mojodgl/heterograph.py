@@ -12,6 +12,7 @@ from .function.base import TargetCode
 from .function.message import BinaryMessageFunction, CopyMessageFunction, MessageFunction
 from .function.reducer import ReduceFunction
 from .ops.sddmm import gsddmm
+from .ops.segment import _replace_inf_with_zero
 from .ops.spmm import gspmm
 from .udf import EdgeBatch, FeatureDict, NodeBatch
 
@@ -35,7 +36,9 @@ class DGLGraph(object):
         if u.shape != v.shape:
             raise DGLError("u and v must have the same length")
         if num_nodes is None:
-            num_nodes = int(max(u.max(initial=0), v.max(initial=0))) + 1
+            # upstream's infer_num_nodes is the largest id plus one, and an
+            # empty edge list has no ids to take a maximum over
+            num_nodes = 0 if u.size == 0 else int(max(u.max(), v.max())) + 1
         num_nodes = int(num_nodes)
         if num_nodes < 0:
             raise DGLError("num_nodes must be non-negative, got {}".format(num_nodes))
@@ -226,6 +229,15 @@ class DGLGraph(object):
     def _reduce_messages(self, message, reduce_op):
         return gspmm(self, "copy_rhs", reduce_op, None, message)
 
+    def _reduce_result(self, reduce_op, reduced):
+        # A node with no in-edges comes out of the kernel as the reduce
+        # identity, so max and min leave infinities there; upstream's
+        # message-passing VM replaces them with zero before the apply
+        # function ever sees them, and so does this port.
+        if reduce_op in ("max", "min"):
+            return _replace_inf_with_zero(reduced)
+        return reduced
+
     def _pass(self, message_func, reduce_func, apply_node_func, write=True):
         """Run one message-passing round; returns the new node features.
 
@@ -239,7 +251,10 @@ class DGLGraph(object):
             op, _, _, lhs_field, rhs_field = fused
             lhs_data = self.ndata[lhs_field] if lhs_field is not None else None
             rhs_data = self.edata[rhs_field] if rhs_field is not None else None
-            result = {reduce_func.out_field: gspmm(self, op, reduce_func.name, lhs_data, rhs_data)}
+            reduced = gspmm(self, op, reduce_func.name, lhs_data, rhs_data)
+            result = {
+                reduce_func.out_field: self._reduce_result(reduce_func.name, reduced)
+            }
         else:
             if isinstance(message_func, MessageFunction):
                 messages = {message_func.out_field: self._builtin_message(message_func)}
@@ -248,9 +263,10 @@ class DGLGraph(object):
                 messages = dict(message_func(edges))
             if isinstance(reduce_func, ReduceFunction):
                 key = next(iter(messages))
+                reduced = self._reduce_messages(messages[key], reduce_func.name)
                 result = {
-                    reduce_func.out_field: self._reduce_messages(
-                        messages[key], reduce_func.name
+                    reduce_func.out_field: self._reduce_result(
+                        reduce_func.name, reduced
                     )
                 }
             else:
