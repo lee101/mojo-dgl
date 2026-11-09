@@ -144,47 +144,57 @@ that need dgl skip.
 
 ## Performance
 
-The table below is one `pixi run bench` invocation on one graph of 200,000
-nodes and 1,000,000 random edges, float64 features, 32 columns. Both
-libraries get the same arrays, each number is the best of three runs, and
-nothing here is extrapolated. Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @
-2.30GHz, 72 cores, Linux x86_64, AVX2, torch 2.3.1.post100, dgl 2.3.0. `W`,
-the SIMD width these kernels are built at, is 4 float64 lanes here.
+The table below is the median of four `pixi run bench-here` invocations (the
+flock-wrapped form of `pixi run bench`; see `bench/verify.md` for why `pixi run
+bench` alone prints only a guard) on one graph of 200,000 nodes and 1,000,000
+random edges, float64 features, 32 columns. Both libraries get the same arrays,
+each number is the best of three runs within an invocation, and the table
+reports the median across the four invocations. Nothing here is extrapolated.
+Machine: Intel(R) Xeon(R) CPU E5-2697 v4 @ 2.30GHz, 72 cores, Linux x86_64,
+AVX2, torch 2.3.1.post100, dgl 2.3.0. `W`, the SIMD width these kernels are
+built at, is 4 float64 lanes here.
 
 | case | mojo-dgl | dgl | speedup |
 | --- | ---: | ---: | ---: |
-| `u_mul_e_sum` (1M edges, 32d) | 158.7 ms | 60.4 ms | 0.38x |
-| `u_add_e_mean` (1M edges, 32d) | 179.0 ms | 70.6 ms | 0.39x |
-| `u_div_e_min` (1M edges, 32d) | 205.8 ms | 234.5 ms | 1.14x |
-| `copy_u_max` (1M edges, 32d) | 99.2 ms | 52.6 ms | 0.53x |
-| `copy_e_mean` (1M edges, 32d) | 91.4 ms | 53.5 ms | 0.59x |
-| `u_dot_e` (SDDMM, 1M edges, 32d) | 114.6 ms | 34.6 ms | 0.30x |
-| `u_mul_v` (SDDMM, 1M edges, 32d) | 306.5 ms | 75.4 ms | 0.25x |
-| `edge_softmax` norm_by=dst (1M edges) | 32.6 ms | 4.0 ms | 0.12x |
-| `edge_softmax` norm_by=src (1M edges) | 32.6 ms | 4.6 ms | 0.14x |
-| `edge_softmax` 8 heads (1M edges, `(E, 8, 1)`) | 200.8 ms | 28.9 ms | 0.14x |
-| `segment_reduce` sum (1M rows, 32d, 200k segments) | 60.2 ms | 30.5 ms | 0.51x |
-| `segment_reduce` max (1M rows, 32d, 200k segments) | 102.2 ms | 104.0 ms | 1.02x |
-| `segment_softmax` (1M rows, 32d, 200k segments) | 380.3 ms | 479.2 ms | **1.26x** |
-| `gather_mm` (1M rows, 16x16, 64 blocks) | 127.4 ms | 402.2 ms | **3.16x** |
-| `update_all` `u_mul_e` + `sum` (1M edges, 32d) | 164.1 ms | 44.5 ms | 0.27x |
-| `update_all` `copy_u` + `max` (1M edges, 32d) | 131.0 ms | 87.6 ms | 0.67x |
+| `u_mul_e_sum` (1M edges, 32d) | 28.2 ms | 27.4 ms | 0.97x |
+| `u_add_e_mean` (1M edges, 32d) | 32.4 ms | 37.5 ms | 1.16x |
+| `u_div_e_min` (1M edges, 32d) | 28.3 ms | 149.8 ms | 5.30x |
+| `copy_u_max` (1M edges, 32d) | 19.0 ms | 39.1 ms | 2.07x |
+| `copy_e_mean` (1M edges, 32d) | 26.2 ms | 30.9 ms | 1.18x |
+| `u_dot_e` (SDDMM, 1M edges, 32d) | 21.8 ms | 10.6 ms | 0.49x |
+| `u_mul_v` (SDDMM, 1M edges, 32d) | 40.4 ms | 47.2 ms | 1.17x |
+| `edge_softmax` norm_by=dst (1M edges) | 10.8 ms | 2.4 ms | 0.22x |
+| `edge_softmax` norm_by=src (1M edges) | 10.9 ms | 2.3 ms | 0.22x |
+| `edge_softmax` 8 heads (1M edges, `(E, 8, 1)`) | 32.4 ms | 19.4 ms | 0.60x |
+| `segment_reduce` sum (1M rows, 32d, 200k segments) | 19.2 ms | 19.2 ms | 1.00x |
+| `segment_reduce` max (1M rows, 32d, 200k segments) | 39.2 ms | 60.0 ms | 1.53x |
+| `segment_softmax` (1M rows, 32d, 200k segments) | 56.1 ms | 286.2 ms | **5.10x** |
+| `gather_mm` (1M rows, 16x16, 64 blocks) | 23.7 ms | 141.8 ms | **5.98x** |
+| `update_all` `u_mul_e` + `sum` (1M edges, 32d) | 33.5 ms | 24.0 ms | 0.72x |
+| `update_all` `copy_u` + `max` (1M edges, 32d) | 36.9 ms | 54.1 ms | 1.47x |
 
 **Read the two columns apart before reading the ratio.** The box this was
-measured on is shared and heavily loaded, which penalises the two columns
-unequally: this port is 32 threads and dgl's kernels are OpenMP over every core,
-so a loaded box distorts them by different amounts. The ratios below are
-therefore an upper bound on this port's standing, not a clean measurement of
-either library at its best. Nothing in the table is extrapolated: every number
-is the best of three runs of the case named, from the run recorded above.
+measured on is shared and heavily loaded (load averages observed 9–77 over the
+verify runs), which penalises the two columns unequally: this port is 32
+threads and dgl's kernels are OpenMP over every core, so a loaded box distorts
+them by different amounts. The ratios above are therefore an upper bound on
+this port's standing, not a clean measurement of either library at its best.
+Nothing in the table is extrapolated: every number is the best of three runs
+of the case named within an invocation, medianed over the four verify
+invocations recorded in `bench/verify.md`.
 
-mojodgl still loses most of the table, and the reason is that dgl's kernels are
+mojodgl loses six rows of this table outright — `u_dot_e`, `edge_softmax`
+(dst, src, and 8 heads), and `update_all` `u_mul_e` + `sum` — and ties
+`segment_reduce` sum at 1.00x. The reason is that dgl's kernels are
 multi-threaded C++ while the work these kernels do is memory-bound. The
-ranking inside the table is worth reading. The wins and near misses —
-`gather_mm`, `segment_softmax`, `u_div_e_min`, `segment_reduce` max — are the
-cases that are one sequential scan over memory, or a matmul small enough to
-stay in cache, with a cheap inner body. That is where upstream's threads have
-least to add.
+ranking inside the table is worth reading. The wins —
+`gather_mm`, `segment_softmax`, `u_div_e_min`, `copy_u_max`,
+`segment_reduce` max — are the cases that are one sequential scan over memory,
+or a matmul small enough to stay in cache, with a cheap inner body. That is
+where upstream's threads have least to add. `u_mul_e_sum` (0.97x) swings
+between 0.82x and 1.50x across individual verify invocations (see
+`bench/verify.md`), i.e. it is at parity within run-to-run noise on this box,
+not a clear win or loss.
 
 The worst cases are the ones whose cost is memory latency. `u_dot_e` and
 `u_mul_v` issue two or more random-indexed loads per edge, and that latency is
